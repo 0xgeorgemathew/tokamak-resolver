@@ -10,8 +10,11 @@ const bool = z
 const ConfigSchema = z.object({
     SRC_CHAIN_RPC: z.string().url(),
     DST_CHAIN_RPC: z.string().url(),
-    SRC_CHAIN_CREATE_FORK: bool.default('true'),
-    DST_CHAIN_CREATE_FORK: bool.default('true')
+    SRC_CHAIN_CREATE_FORK: bool.default('false'),
+    DST_CHAIN_CREATE_FORK: bool.default('false'),
+    USER_PRIVATE_KEY: z.string().regex(/^0x[a-fA-F0-9]{64}$/, 'Invalid private key format'),
+    RESOLVER_PRIVATE_KEY: z.string().regex(/^0x[a-fA-F0-9]{64}$/, 'Invalid private key format'),
+    DEPLOYER_PRIVATE_KEY: z.string().regex(/^0x[a-fA-F0-9]{64}$/, 'Invalid private key format')
 })
 
 const fromEnv = ConfigSchema.parse(process.env)
@@ -19,34 +22,47 @@ const fromEnv = ConfigSchema.parse(process.env)
 export const config = {
     chain: {
         source: {
-            chainId: Sdk.NetworkEnum.ETHEREUM,
+            chainId: 11155111, // Sepolia
             url: fromEnv.SRC_CHAIN_RPC,
             createFork: fromEnv.SRC_CHAIN_CREATE_FORK,
-            limitOrderProtocol: '0x111111125421ca6dc452d289314280a0f8842a65',
-            wrappedNative: '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2',
-            ownerPrivateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+            limitOrderProtocol: '0xc4C35f0511950a9E4E8674BB4ec74B61d55137C1',
+            wrappedNative: '0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9', // feeToken on Sepolia
+            escrowFactory: '0x9e2Fb5498f3c52b0c8EC2aA4E1B5D234C99b6B67',
+            resolver: '0x3E8769f963e5E1671f4F1845aeB6Efd4343AEA16',
             tokens: {
-                USDC: {
-                    address: '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
-                    donor: '0xd54F23BE482D9A58676590fCa79c8E43087f92fB'
+                SwapToken: {
+                    address: '0x085619Cef93E5A6Cff7683558418424748880663'
                 }
             }
         },
         destination: {
-            chainId: Sdk.NetworkEnum.BINANCE,
+            chainId: 10143, // Monad
             url: fromEnv.DST_CHAIN_RPC,
             createFork: fromEnv.DST_CHAIN_CREATE_FORK,
-            limitOrderProtocol: '0x111111125421ca6dc452d289314280a0f8842a65',
-            wrappedNative: '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',
-            ownerPrivateKey: '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80',
+            limitOrderProtocol: '0xb5aA32B29CBf8aC76e804E230EF3200d17eF099f',
+            wrappedNative: '0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701', // feeToken on Monad
+            escrowFactory: '0xe02F5B45E3B29Dac9a1B6aFeA99FF1377Cdd673E',
+            resolver: '0xc0013D26d4F9d25AfB9004f37cba09af68Eb1315',
             tokens: {
-                USDC: {
-                    address: '0x8965349fb649a33a30cbfda057d8ec2c48abe2a2',
-                    donor: '0x4188663a85C92EEa35b5AD3AA5cA7CeB237C6fe9'
+                SwapToken: {
+                    address: '0x3A84567b87a039FFD5043949E0Ae119617746539'
                 }
             }
         }
+    },
+    privateKeys: {
+        user: fromEnv.USER_PRIVATE_KEY,
+        resolver: fromEnv.RESOLVER_PRIVATE_KEY,
+        deployer: fromEnv.DEPLOYER_PRIVATE_KEY
     }
 } as const
 
 export type ChainConfig = (typeof config.chain)['source' | 'destination']
+
+// Add type declaration to ensure compatibility with existing code
+declare module '@1inch/cross-chain-sdk' {
+    namespace NetworkEnum {
+        const SEPOLIA: 11155111
+        const MONAD: 10143
+    }
+}

@@ -6,14 +6,11 @@ import {anvil} from 'prool/instances'
 
 import Sdk from '@1inch/cross-chain-sdk'
 import {
-    computeAddress,
-    ContractFactory,
     JsonRpcProvider,
     MaxUint256,
     parseEther,
     parseUnits,
-    randomBytes,
-    Wallet as SignerWallet
+    randomBytes
 } from 'ethers'
 import {uint8ArrayToHex, UINT_40_MAX} from '@1inch/byte-utils'
 import assert from 'node:assert'
@@ -21,15 +18,13 @@ import {ChainConfig, config} from './config'
 import {Wallet} from './wallet'
 import {Resolver} from './resolver'
 import {EscrowFactory} from './escrow-factory'
-import factoryContract from '../dist/contracts/TestEscrowFactory.sol/TestEscrowFactory.json'
-import resolverContract from '../dist/contracts/Resolver.sol/Resolver.json'
 
 const {Address} = Sdk
 
-jest.setTimeout(1000 * 60)
+jest.setTimeout(1000 * 300) // 5 minutes for real testnet operations
 
-const userPk = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d'
-const resolverPk = '0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a'
+const userPk = config.privateKeys.user
+const resolverPk = config.privateKeys.resolver
 
 // eslint-disable-next-line max-lines-per-function
 describe('Resolving example', () => {
@@ -59,44 +54,92 @@ describe('Resolving example', () => {
     let srcTimestamp: bigint
 
     async function increaseTime(t: number): Promise<void> {
+        // For real testnets, we can't manipulate time, so we just wait
+        if (!config.chain.source.createFork && !config.chain.destination.createFork) {
+            console.log(`⏳ Waiting ${t} seconds for time-lock progression...`)
+            await new Promise(resolve => setTimeout(resolve, t * 1000))
+            return
+        }
+        
+        // For local forks, use evm_increaseTime
         await Promise.all([src, dst].map((chain) => chain.provider.send('evm_increaseTime', [t])))
+    }
+
+    async function validateNetworkConnectivity(): Promise<void> {
+        try {
+            const [srcBlock, dstBlock] = await Promise.all([
+                src.provider.getBlockNumber(),
+                dst.provider.getBlockNumber()
+            ])
+            console.log(`✅ Connected to Sepolia (block ${srcBlock}) and Monad (block ${dstBlock})`)
+        } catch (error) {
+            throw new Error(`❌ Network connectivity check failed: ${error}`)
+        }
+    }
+
+    async function validateBalances(): Promise<void> {
+        const srcUserBalance = await srcChainUser.getNativeBalance()
+        const dstResolverBalance = await dstChainResolver.getNativeBalance()
+        
+        const minBalance = parseEther('0.01') // Minimum 0.01 ETH for gas
+        
+        if (srcUserBalance < minBalance) {
+            throw new Error(`❌ Insufficient Sepolia ETH balance for user: ${srcUserBalance} (minimum: ${minBalance})`)
+        }
+        
+        if (dstResolverBalance < minBalance) {
+            throw new Error(`❌ Insufficient Monad native balance for resolver: ${dstResolverBalance} (minimum: ${minBalance})`)
+        }
+        
+        console.log(`✅ Sufficient balances - User: ${srcUserBalance} ETH, Resolver: ${dstResolverBalance} native`)
     }
 
     beforeAll(async () => {
         ;[src, dst] = await Promise.all([initChain(config.chain.source), initChain(config.chain.destination)])
+
+        // Validate network connectivity
+        await validateNetworkConnectivity()
 
         srcChainUser = new Wallet(userPk, src.provider)
         dstChainUser = new Wallet(userPk, dst.provider)
         srcChainResolver = new Wallet(resolverPk, src.provider)
         dstChainResolver = new Wallet(resolverPk, dst.provider)
 
+        // Validate balances for real testnet usage
+        await validateBalances()
+
         srcFactory = new EscrowFactory(src.provider, src.escrowFactory)
         dstFactory = new EscrowFactory(dst.provider, dst.escrowFactory)
-        // get 1000 USDC for user in SRC chain and approve to LOP
-        await srcChainUser.topUpFromDonor(
-            config.chain.source.tokens.USDC.address,
-            config.chain.source.tokens.USDC.donor,
-            parseUnits('1000', 6)
-        )
+
+        // For real testnets, check if user already has SwapTokens
+        const userTokenBalance = await srcChainUser.tokenBalance(config.chain.source.tokens.SwapToken.address)
+        if (userTokenBalance < parseUnits('100', 18)) {
+            console.log(`⚠️  User needs SwapTokens on Sepolia. Current balance: ${userTokenBalance}`)
+            console.log('Please obtain SwapTokens from the faucet or deployer before running tests.')
+        }
+
         await srcChainUser.approveToken(
-            config.chain.source.tokens.USDC.address,
+            config.chain.source.tokens.SwapToken.address,
             config.chain.source.limitOrderProtocol,
             MaxUint256
         )
 
-        // get 2000 USDC for resolver in DST chain
-        srcResolverContract = await Wallet.fromAddress(src.resolver, src.provider)
-        dstResolverContract = await Wallet.fromAddress(dst.resolver, dst.provider)
-        await dstResolverContract.topUpFromDonor(
-            config.chain.destination.tokens.USDC.address,
-            config.chain.destination.tokens.USDC.donor,
-            parseUnits('2000', 6)
-        )
-        // top up contract for approve
-        await dstChainResolver.transfer(dst.resolver, parseEther('1'))
-        await dstResolverContract.unlimitedApprove(config.chain.destination.tokens.USDC.address, dst.escrowFactory)
+        // Set up resolver contracts
+        srcResolverContract = await Wallet.fromAddress(src.resolver, src.provider, resolverPk)
+        dstResolverContract = await Wallet.fromAddress(dst.resolver, dst.provider, resolverPk)
+        
+        // Check resolver token balance
+        const resolverTokenBalance = await dstResolverContract.tokenBalance(config.chain.destination.tokens.SwapToken.address)
+        if (resolverTokenBalance < parseUnits('200', 18)) {
+            console.log(`⚠️  Resolver needs SwapTokens on Monad. Current balance: ${resolverTokenBalance}`)
+            console.log('Please obtain SwapTokens from the faucet or deployer before running tests.')
+        }
+
+        await dstResolverContract.unlimitedApprove(config.chain.destination.tokens.SwapToken.address, dst.escrowFactory)
 
         srcTimestamp = BigInt((await src.provider.getBlock('latest'))!.timestamp)
+        
+        console.log('🚀 Setup complete - ready for cross-chain swap demo!')
     })
 
     async function getBalances(
@@ -123,11 +166,20 @@ describe('Resolving example', () => {
 
     // eslint-disable-next-line max-lines-per-function
     describe('Fill', () => {
-        it('should swap Ethereum USDC -> Bsc USDC. Single fill only', async () => {
+        it('should swap Sepolia SwapToken -> Monad SwapToken. Single fill only', async () => {
+            console.log('\n🎯 [DEMO] Starting Single Fill Cross-Chain Swap')
+            console.log('📊 Swapping 100 SwapToken from Sepolia → 99 SwapToken on Monad')
+            
             const initialBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
+
+            console.log(`💰 Initial Balances:`)
+            console.log(`   User Sepolia: ${initialBalances.src.user} SwapToken`)
+            console.log(`   User Monad: ${initialBalances.dst.user} SwapToken`)
+            console.log(`   Resolver Sepolia: ${initialBalances.src.resolver} SwapToken`)
+            console.log(`   Resolver Monad: ${initialBalances.dst.resolver} SwapToken`)
 
             // User creates order
             const secret = uint8ArrayToHex(randomBytes(32)) // note: use crypto secure random number in real world
@@ -136,10 +188,10 @@ describe('Resolving example', () => {
                 {
                     salt: Sdk.randBigInt(1000n),
                     maker: new Address(await srcChainUser.getAddress()),
-                    makingAmount: parseUnits('100', 6),
-                    takingAmount: parseUnits('99', 6),
-                    makerAsset: new Address(config.chain.source.tokens.USDC.address),
-                    takerAsset: new Address(config.chain.destination.tokens.USDC.address)
+                    makingAmount: parseUnits('100', 18),
+                    takingAmount: parseUnits('99', 18),
+                    makerAsset: new Address(config.chain.source.tokens.SwapToken.address),
+                    takerAsset: new Address(config.chain.destination.tokens.SwapToken.address)
                 },
                 {
                     hashLock: Sdk.HashLock.forSingleFill(secret),
@@ -153,7 +205,7 @@ describe('Resolving example', () => {
                         dstCancellation: 101n // 1sec public withdrawal
                     }),
                     srcChainId,
-                    dstChainId,
+                    dstChainId: dstChainId as any,
                     srcSafetyDeposit: parseEther('0.001'),
                     dstSafetyDeposit: parseEther('0.001')
                 },
@@ -247,8 +299,8 @@ describe('Resolving example', () => {
             )
 
             const resultBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // user transferred funds to resolver on source chain
@@ -259,10 +311,10 @@ describe('Resolving example', () => {
             expect(initialBalances.dst.resolver - resultBalances.dst.resolver).toBe(order.takingAmount)
         })
 
-        it('should swap Ethereum USDC -> Bsc USDC. Multiple fills. Fill 100%', async () => {
+        it('should swap Sepolia SwapToken -> Monad SwapToken. Multiple fills. Fill 100%', async () => {
             const initialBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // User creates order
@@ -275,10 +327,10 @@ describe('Resolving example', () => {
                 {
                     salt: Sdk.randBigInt(1000n),
                     maker: new Address(await srcChainUser.getAddress()),
-                    makingAmount: parseUnits('100', 6),
-                    takingAmount: parseUnits('99', 6),
-                    makerAsset: new Address(config.chain.source.tokens.USDC.address),
-                    takerAsset: new Address(config.chain.destination.tokens.USDC.address)
+                    makingAmount: parseUnits('100', 18),
+                    takingAmount: parseUnits('99', 18),
+                    makerAsset: new Address(config.chain.source.tokens.SwapToken.address),
+                    takerAsset: new Address(config.chain.destination.tokens.SwapToken.address)
                 },
                 {
                     hashLock: Sdk.HashLock.forMultipleFills(leaves),
@@ -292,7 +344,7 @@ describe('Resolving example', () => {
                         dstCancellation: 101n // 1sec public withdrawal
                     }),
                     srcChainId,
-                    dstChainId,
+                    dstChainId: dstChainId as any,
                     srcSafetyDeposit: parseEther('0.001'),
                     dstSafetyDeposit: parseEther('0.001')
                 },
@@ -399,8 +451,8 @@ describe('Resolving example', () => {
             )
 
             const resultBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // user transferred funds to resolver on the source chain
@@ -411,10 +463,10 @@ describe('Resolving example', () => {
             expect(initialBalances.dst.resolver - resultBalances.dst.resolver).toBe(order.takingAmount)
         })
 
-        it('should swap Ethereum USDC -> Bsc USDC. Multiple fills. Fill 50%', async () => {
+        it('should swap Sepolia SwapToken -> Monad SwapToken. Multiple fills. Fill 50%', async () => {
             const initialBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // User creates order
@@ -427,10 +479,10 @@ describe('Resolving example', () => {
                 {
                     salt: Sdk.randBigInt(1000n),
                     maker: new Address(await srcChainUser.getAddress()),
-                    makingAmount: parseUnits('100', 6),
-                    takingAmount: parseUnits('99', 6),
-                    makerAsset: new Address(config.chain.source.tokens.USDC.address),
-                    takerAsset: new Address(config.chain.destination.tokens.USDC.address)
+                    makingAmount: parseUnits('100', 18),
+                    takingAmount: parseUnits('99', 18),
+                    makerAsset: new Address(config.chain.source.tokens.SwapToken.address),
+                    takerAsset: new Address(config.chain.destination.tokens.SwapToken.address)
                 },
                 {
                     hashLock: Sdk.HashLock.forMultipleFills(leaves),
@@ -444,7 +496,7 @@ describe('Resolving example', () => {
                         dstCancellation: 101n // 1sec public withdrawal
                     }),
                     srcChainId,
-                    dstChainId,
+                    dstChainId: dstChainId as any,
                     srcSafetyDeposit: parseEther('0.001'),
                     dstSafetyDeposit: parseEther('0.001')
                 },
@@ -550,8 +602,8 @@ describe('Resolving example', () => {
             )
 
             const resultBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // user transferred funds to resolver on the source chain
@@ -565,10 +617,10 @@ describe('Resolving example', () => {
     })
 
     describe('Cancel', () => {
-        it('should cancel swap Ethereum USDC -> Bsc USDC', async () => {
+        it('should cancel swap Sepolia SwapToken -> Monad SwapToken', async () => {
             const initialBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             // User creates order
@@ -578,10 +630,10 @@ describe('Resolving example', () => {
                 {
                     salt: Sdk.randBigInt(1000n),
                     maker: new Address(await srcChainUser.getAddress()),
-                    makingAmount: parseUnits('100', 6),
-                    takingAmount: parseUnits('99', 6),
-                    makerAsset: new Address(config.chain.source.tokens.USDC.address),
-                    takerAsset: new Address(config.chain.destination.tokens.USDC.address)
+                    makingAmount: parseUnits('100', 18),
+                    takingAmount: parseUnits('99', 18),
+                    makerAsset: new Address(config.chain.source.tokens.SwapToken.address),
+                    takerAsset: new Address(config.chain.destination.tokens.SwapToken.address)
                 },
                 {
                     hashLock,
@@ -595,7 +647,7 @@ describe('Resolving example', () => {
                         dstCancellation: 101n // 1sec public withdrawal
                     }),
                     srcChainId,
-                    dstChainId,
+                    dstChainId: dstChainId as any,
                     srcSafetyDeposit: parseEther('0.001'),
                     dstSafetyDeposit: parseEther('0.001')
                 },
@@ -686,8 +738,8 @@ describe('Resolving example', () => {
             console.log(`[${srcChainId}]`, `Cancelled src escrow ${srcEscrowAddress} in tx ${cancelSrcEscrow}`)
 
             const resultBalances = await getBalances(
-                config.chain.source.tokens.USDC.address,
-                config.chain.destination.tokens.USDC.address
+                config.chain.source.tokens.SwapToken.address,
+                config.chain.destination.tokens.SwapToken.address
             )
 
             expect(initialBalances).toEqual(resultBalances)
@@ -699,36 +751,13 @@ async function initChain(
     cnf: ChainConfig
 ): Promise<{node?: CreateServerReturnType; provider: JsonRpcProvider; escrowFactory: string; resolver: string}> {
     const {node, provider} = await getProvider(cnf)
-    const deployer = new SignerWallet(cnf.ownerPrivateKey, provider)
 
-    // deploy EscrowFactory
-    const escrowFactory = await deploy(
-        factoryContract,
-        [
-            cnf.limitOrderProtocol,
-            cnf.wrappedNative, // feeToken,
-            Address.fromBigInt(0n).toString(), // accessToken,
-            deployer.address, // owner
-            60 * 30, // src rescue delay
-            60 * 30 // dst rescue delay
-        ],
-        provider,
-        deployer
-    )
-    console.log(`[${cnf.chainId}]`, `Escrow factory contract deployed to`, escrowFactory)
+    // Use deployed contracts instead of deploying new ones
+    const escrowFactory = cnf.escrowFactory
+    const resolver = cnf.resolver
 
-    // deploy Resolver contract
-    const resolver = await deploy(
-        resolverContract,
-        [
-            escrowFactory,
-            cnf.limitOrderProtocol,
-            computeAddress(resolverPk) // resolver as owner of contract
-        ],
-        provider,
-        deployer
-    )
-    console.log(`[${cnf.chainId}]`, `Resolver contract deployed to`, resolver)
+    console.log(`[${cnf.chainId}]`, `Using deployed escrow factory at`, escrowFactory)
+    console.log(`[${cnf.chainId}]`, `Using deployed resolver at`, resolver)
 
     return {node: node, provider, resolver, escrowFactory}
 }
@@ -737,12 +766,15 @@ async function getProvider(cnf: ChainConfig): Promise<{node?: CreateServerReturn
     if (!cnf.createFork) {
         return {
             provider: new JsonRpcProvider(cnf.url, cnf.chainId, {
-                cacheTimeout: -1,
-                staticNetwork: true
+                cacheTimeout: 30000, // 30 second cache for real networks
+                staticNetwork: true,
+                polling: true,
+                pollingInterval: 4000 // 4 second polling interval
             })
         }
     }
 
+    console.log(`🔧 Creating local fork of ${cnf.chainId === 11155111 ? 'Sepolia' : 'Monad'} testnet...`)
     const node = createServer({
         instance: anvil({forkUrl: cnf.url, chainId: cnf.chainId}),
         limit: 1
@@ -763,17 +795,3 @@ async function getProvider(cnf: ChainConfig): Promise<{node?: CreateServerReturn
     }
 }
 
-/**
- * Deploy contract and return its address
- */
-async function deploy(
-    json: {abi: any; bytecode: any},
-    params: unknown[],
-    provider: JsonRpcProvider,
-    deployer: SignerWallet
-): Promise<string> {
-    const deployed = await new ContractFactory(json.abi, json.bytecode, deployer).deploy(...params)
-    await deployed.waitForDeployment()
-
-    return await deployed.getAddress()
-}

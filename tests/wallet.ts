@@ -17,12 +17,20 @@ export class Wallet {
                 : privateKeyOrSigner
     }
 
-    public static async fromAddress(address: string, provider: JsonRpcProvider): Promise<Wallet> {
-        await provider.send('anvil_impersonateAccount', [address.toString()])
-
-        const signer = await provider.getSigner(address.toString())
-
-        return new Wallet(signer, provider)
+    public static async fromAddress(address: string, provider: JsonRpcProvider, privateKey?: string): Promise<Wallet> {
+        if (privateKey) {
+            // Use the provided private key for real testnet
+            return new Wallet(privateKey, provider)
+        }
+        
+        // For local testing with anvil/hardhat
+        try {
+            await provider.send('anvil_impersonateAccount', [address.toString()])
+            const signer = await provider.getSigner(address.toString())
+            return new Wallet(signer, provider)
+        } catch (error) {
+            throw new Error(`Cannot impersonate account ${address}. For testnet usage, provide the private key.`)
+        }
     }
 
     async tokenBalance(token: string): Promise<bigint> {
@@ -31,9 +39,20 @@ export class Wallet {
         return tokenContract.balanceOf(await this.getAddress())
     }
 
-    async topUpFromDonor(token: string, donor: string, amount: bigint): Promise<void> {
-        const donorWallet = await Wallet.fromAddress(donor, this.provider)
+    async topUpFromDonor(token: string, donor: string, amount: bigint, donorPrivateKey?: string): Promise<void> {
+        const donorWallet = await Wallet.fromAddress(donor, this.provider, donorPrivateKey)
         await donorWallet.transferToken(token, await this.getAddress(), amount)
+    }
+
+    // Helper method to check if user has sufficient balance
+    async checkSufficientBalance(token: string, requiredAmount: bigint): Promise<boolean> {
+        const balance = await this.tokenBalance(token)
+        return balance >= requiredAmount
+    }
+
+    // Helper method to check native token balance
+    async getNativeBalance(): Promise<bigint> {
+        return this.provider.getBalance(await this.getAddress())
     }
 
     public async getAddress(): Promise<string> {
@@ -92,18 +111,37 @@ export class Wallet {
         )
     }
 
-    async send(param: TransactionRequest): Promise<{txHash: string; blockTimestamp: bigint; blockHash: string}> {
-        const res = await this.signer.sendTransaction({...param, gasLimit: 10_000_000, from: this.getAddress()})
-        const receipt = await res.wait(1)
+    async send(param: TransactionRequest, retries = 3): Promise<{txHash: string; blockTimestamp: bigint; blockHash: string}> {
+        for (let attempt = 1; attempt <= retries; attempt++) {
+            try {
+                const res = await this.signer.sendTransaction({
+                    ...param, 
+                    gasLimit: param.gasLimit || 1_000_000, // Reduced default gas limit for real networks
+                    from: this.getAddress()
+                })
+                const receipt = await res.wait(1)
 
-        if (receipt && receipt.status) {
-            return {
-                txHash: receipt.hash,
-                blockTimestamp: BigInt((await res.getBlock())!.timestamp),
-                blockHash: res.blockHash as string
+                if (receipt && receipt.status) {
+                    return {
+                        txHash: receipt.hash,
+                        blockTimestamp: BigInt((await res.getBlock())!.timestamp),
+                        blockHash: res.blockHash as string
+                    }
+                }
+
+                throw new Error((await receipt?.getResult()) || 'Transaction failed')
+            } catch (error: any) {
+                console.warn(`Transaction attempt ${attempt}/${retries} failed:`, error.message)
+                
+                if (attempt === retries) {
+                    throw error
+                }
+                
+                // Wait before retry (exponential backoff)
+                await new Promise(resolve => setTimeout(resolve, 1000 * attempt))
             }
         }
-
-        throw new Error((await receipt?.getResult()) || 'unknown error')
+        
+        throw new Error('All transaction attempts failed')
     }
 }
